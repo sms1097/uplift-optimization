@@ -1,15 +1,19 @@
-import optuna.integration.lightgbm as lgb
 from functools import partial
 import numpy as np
 import pandas as pd
 
+import optuna.integration.lightgbm as lgb
 
-class NeVOX:
+from lightgbm import early_stopping
+from lightgbm import LGBMClassifier
+
+
+class XLearner:
     """
     Net Value Optimized X Learner
 
     Uplift Modeling for Multiple Treatments with Cost Optimization
-    Zhao & Harinen (2019) 
+    Zhao & Harinen (2019)
 
     Parameters:
     ----------------
@@ -24,19 +28,17 @@ class NeVOX:
         regressor will work here.
     """
 
-    def __init__(
-        self,
-        ic_lookup,
-        cc_lookup,
-        control=0,
-        base_classifier=partial(XGBClassifier),
-        base_regressor=partial(XGBRegressor),
-    ):
-        self.base_classifier = base_classifier
-        self.base_regressor = base_regressor
+    def __init__(self, ic_lookup=None, cc_lookup=None, control=0):
         self.control = control
         self.ic_lookup = ic_lookup
         self.cc_lookup = cc_lookup
+
+    def make_valid_sets(self, X, y, frac=0.1):
+        idx = np.arange(X.shape[0])
+        val_idx = np.random.choice(idx, int(X.shape[0] * frac))
+        dtrain = lgb.Dataset(X[~val_idx], label=y[~val_idx])
+        dval = lgb.Dataset(X[val_idx], label=y[val_idx])
+        return dtrain, dval
 
     def fit(self, X, y, T, v):
         """
@@ -53,8 +55,16 @@ class NeVOX:
         # stage 1: fit response_models
         for t in self.treatments_:
             treatment_idx = np.where(T == t)[0]
-            m = self.base_classifier()
-            m.fit(X[treatment_idx], y[treatment_idx])
+            dtrain, dval = self.make_valid_sets(X[treatment_idx], y[treatment_idx])
+            m = lgb.train(
+                {
+                    "objective": "binary",
+                    "boosting_type": "gbdt",
+                },
+                dtrain,
+                valid_sets=[dtrain, dval],
+                callbacks=[early_stopping(100)],
+            )
             self.response_models[t] = m
 
         # stage 2: Compute psuedo treatment effects
@@ -64,36 +74,47 @@ class NeVOX:
 
             treatment_idx = np.where(T == t)[0]
             control_idx = np.where(T == self.control)[0]
+            if self.cc_lookup is not None and self.ic_lookup is not None:
+                s_t0 = np.ones(control_idx.shape[0]) * self.cc_lookup[self.control]
+                s_tj = np.ones(treatment_idx.shape[0]) * self.cc_lookup[t]
 
-            s_t0 = np.ones(control_idx.shape[0]) * self.cc_lookup[self.control]
-            s_tj = np.ones(treatment_idx.shape[0]) * self.cc_lookup[t]
+                ic_t0 = np.ones(control_idx.shape[0]) * self.ic_lookup[self.control]
+                ic_tj = np.ones(treatment_idx.shape[0]) * self.cc_lookup[t]
 
-            ic_t0 = np.ones(control_idx.shape[0]) * self.ic_lookup[self.control]
-            ic_tj = np.ones(treatment_idx.shape[0]) * self.cc_lookup[t]
+                D_t0 = (v[control_idx] - s_t0) * (
+                    (v[control_idx] - s_t0) * mj.predict(X[control_idx])
+                    - v[control_idx] * y[control_idx]
+                ) - ic_t0
 
-            D_t0 = (v[control_idx] - s_t0) * (
-                (v[control_idx] - s_t0) * mj.predict(X[control_idx])
-                - v[control_idx] * y[control_idx]
-            ) - ic_t0
-
-            D_tj = (v[treatment_idx] - s_tj) * (
-                y[treatment_idx] - v[treatment_idx] * m0.predict(X[treatment_idx])
-            ) - ic_tj
+                D_tj = (v[treatment_idx] - s_tj) * (
+                    y[treatment_idx] - v[treatment_idx] * m0.predict(X[treatment_idx])
+                ) - ic_tj
+            else:
+                D_t0 = mj.predict(X[control_idx]) - y[control_idx]
+                D_tj = y[treatment_idx] - m0.predict(X[treatment_idx])
 
             t0_effect_key = f"{self.control}_{t}"
             tj_effect_key = f"{t}_{self.control}"
 
-            self.psuedo_models[t0_effect_key] = self.base_regressor().fit(
-                X[control_idx], D_t0
-            )
-
-            self.psuedo_models[tj_effect_key] = self.base_regressor().fit(
+            dtrain_control, dval_control = self.make_valid_sets(X[control_idx], D_t0)
+            dtrain_treatment, dval_treatment = self.make_valid_sets(
                 X[treatment_idx], D_tj
+            )
+            self.psuedo_models[t0_effect_key] = lgb.train(
+                {"objective": "regression", "metric": "l2"},
+                dtrain_control,
+                valid_sets=[dtrain_control, dval_control],
+                callbacks=[early_stopping(100)],
+            )
+            self.psuedo_models[tj_effect_key] = lgb.train(
+                {"objective": "regression", "metric": "l2"},
+                dtrain_treatment,
+                valid_sets=[dtrain_treatment, dval_treatment],
+                callbacks=[early_stopping(100)],
             )
 
         # stage 3: Fit propensity model
-        self.e_ = self.base_classifier()
-        self.e_.fit(X, T)
+        self.e_ = LGBMClassifier().fit(X, T)
 
     def predict_cate(self, X):
         """
