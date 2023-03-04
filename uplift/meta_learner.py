@@ -4,21 +4,18 @@ import pandas as pd
 
 import optuna.integration.lightgbm as lgb
 
-from lightgbm import early_stopping
-from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier, XGBRegressor
 
 
 class XLearner:
     """
-    Net Value Optimized X Learner
-
+    X Learner with Net Value Optimization from
     Uplift Modeling for Multiple Treatments with Cost Optimization
     Zhao & Harinen (2019)
-
     Parameters:
     ----------------
-    ic_lookup (dict): impresson cost lookup for each treatment
-    cc_lookup (dict): conversion cost lookup for each treatment
+    ic_lookup (dict): impresson cost lookup for each treatment, if None defaults to default XLearner
+    cc_lookup (dict): conversion cost lookup for each treatment, if None defaults to default XLearner
     control (int): key for control in lookups
     base_classifier partial(Classifier): classifier used for any task in
         the optimziation pipeline for classification. Any sklearn complient
@@ -28,24 +25,30 @@ class XLearner:
         regressor will work here.
     """
 
-    def __init__(self, ic_lookup=None, cc_lookup=None, control=0):
+    def __init__(
+        self,
+        ic_lookup=None,
+        cc_lookup=None,
+        control=0,
+        base_classifier=partial(XGBClassifier),
+        base_regressor=partial(XGBRegressor),
+    ):
+        self.base_classifier = base_classifier
+        self.base_regressor = base_regressor
         self.control = control
         self.ic_lookup = ic_lookup
         self.cc_lookup = cc_lookup
 
-    def make_valid_sets(self, X, y, frac=0.1):
-        idx = np.arange(X.shape[0])
-        val_idx = np.random.choice(idx, int(X.shape[0] * frac))
-        dtrain = lgb.Dataset(X[~val_idx], label=y[~val_idx])
-        dval = lgb.Dataset(X[val_idx], label=y[val_idx])
-        return dtrain, dval
-
-    def fit(self, X, y, T, v):
+    def fit(self, X, y, T, v=None):
         """
+        Originally this code was inspiried by Causal Inference for the Brave and True
+
+        Parameters:
+        --------------
         X (num_samples, num_features): feature array for observations
         y (num_samples, 1): boolean outcome
         T (num_samples, 1): observed treatments
-        v (num_samples, 1): estimated value of conversion
+        v (num_samples, 1): estimated value of conversion, if None defaults to regular XLearner
         """
 
         self.treatments_ = np.unique(T)
@@ -55,16 +58,8 @@ class XLearner:
         # stage 1: fit response_models
         for t in self.treatments_:
             treatment_idx = np.where(T == t)[0]
-            dtrain, dval = self.make_valid_sets(X[treatment_idx], y[treatment_idx])
-            m = lgb.train(
-                {
-                    "objective": "binary",
-                    "boosting_type": "gbdt",
-                },
-                dtrain,
-                valid_sets=[dtrain, dval],
-                callbacks=[early_stopping(100)],
-            )
+            m = self.base_classifier()
+            m.fit(X[treatment_idx], y[treatment_idx])
             self.response_models[t] = m
 
         # stage 2: Compute psuedo treatment effects
@@ -74,7 +69,12 @@ class XLearner:
 
             treatment_idx = np.where(T == t)[0]
             control_idx = np.where(T == self.control)[0]
-            if self.cc_lookup is not None and self.ic_lookup is not None:
+
+            if (
+                self.cc_lookup is not None
+                and self.ic_lookup is not None
+                and v is not None
+            ):
                 s_t0 = np.ones(control_idx.shape[0]) * self.cc_lookup[self.control]
                 s_tj = np.ones(treatment_idx.shape[0]) * self.cc_lookup[t]
 
@@ -89,6 +89,7 @@ class XLearner:
                 D_tj = (v[treatment_idx] - s_tj) * (
                     y[treatment_idx] - v[treatment_idx] * m0.predict(X[treatment_idx])
                 ) - ic_tj
+
             else:
                 D_t0 = mj.predict(X[control_idx]) - y[control_idx]
                 D_tj = y[treatment_idx] - m0.predict(X[treatment_idx])
@@ -96,27 +97,19 @@ class XLearner:
             t0_effect_key = f"{self.control}_{t}"
             tj_effect_key = f"{t}_{self.control}"
 
-            dtrain_control, dval_control = self.make_valid_sets(X[control_idx], D_t0)
-            dtrain_treatment, dval_treatment = self.make_valid_sets(
+            self.psuedo_models[t0_effect_key] = self.base_regressor().fit(
+                X[control_idx], D_t0
+            )
+
+            self.psuedo_models[tj_effect_key] = self.base_regressor().fit(
                 X[treatment_idx], D_tj
-            )
-            self.psuedo_models[t0_effect_key] = lgb.train(
-                {"objective": "regression", "metric": "l2"},
-                dtrain_control,
-                valid_sets=[dtrain_control, dval_control],
-                callbacks=[early_stopping(100)],
-            )
-            self.psuedo_models[tj_effect_key] = lgb.train(
-                {"objective": "regression", "metric": "l2"},
-                dtrain_treatment,
-                valid_sets=[dtrain_treatment, dval_treatment],
-                callbacks=[early_stopping(100)],
             )
 
         # stage 3: Fit propensity model
-        self.e_ = LGBMClassifier().fit(X, T)
+        self.e_ = self.base_classifier()
+        self.e_.fit(X, T)
 
-    def predict_cate(self, X):
+    def predict(self, X):
         """
         output CATE for each treatment
         Assumes 0 CATE for control
@@ -135,10 +128,10 @@ class XLearner:
             ) + probs[:, self.control] * self.psuedo_models[tauj_key].predict(X)
             cate_tracker[t] = cate
 
-        cate_tracker[self.control] = 0
+        cate_tracker[self.control] = self.response_models[self.control].predict_proba(X)[:, 0]
         return pd.DataFrame(cate_tracker)
 
     def get_best_action(self, X):
-        cate = self.predict_cate(X)
+        cate = self.predict(X)
         best_action = cate.idxmax(axis=1)
         return best_action
