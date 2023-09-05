@@ -125,7 +125,7 @@ class XLearner:
             denom = probs[:, self.control] + probs[:, t]
             cate = probs[:, t] / denom * self.psuedo_models[tau0_key].predict(
                 X
-            ) + probs[:, self.control] * self.psuedo_models[tauj_key].predict(X)
+            ) + probs[:, self.control] / denom * self.psuedo_models[tauj_key].predict(X)
             cate_tracker[t] = cate
 
         cate_tracker[self.control] = self.response_models[self.control].predict_proba(X)[:, 0]
